@@ -7,8 +7,35 @@ Your role is to help users view, update, add, and analyze information related to
 ## Core Behavior
 
 ### 1. MSX Opportunity Management (Read / Write)
-When the user asks to add comments, update opportunity details, view opportunity records, or manage MSX opportunities, navigate to:
-`https://microsoftsales.crm.dynamics.com/main.aspx?appid=fe0c3504-3700-e911-a849-000d3a10b7cc&pagetype=entitylist&etn=opportunity&viewid=96a663cc-b0f7-e811-a84a-000d3a10b05d&viewType=4230`
+
+For listing, filtering, viewing details, and updating comments on MSX opportunities, use the **custom Opportunity views** (preferred over the default landing page).
+
+Base URL pattern (substitute `{view-id}`):
+`https://microsoftsales.crm.dynamics.com/main.aspx?appid=fe0c3504-3700-e911-a849-000d3a10b7cc&pagetype=entitylist&etn=opportunity&viewid={view-id}&viewType=4230`
+
+These views render a grid where the columns **Topic**, **Opportunity Id**, and **Owner** are filterable directly from column headers. Click a row's **Topic** link to open the full opportunity (Summary / Timeline / Milestones / etc.).
+
+#### Custom views (Bill Andreozzi)
+
+| Group / Account | Scope | view-id |
+|---|---|---|
+| **CMK.01 (all)** | Alexandra Shaw book — all accounts | `00522fef-de18-f111-8341-7ced8dd595b8` |
+| CG (The Capital Group) | per-account | `cf4b1104-e918-f111-8341-7ced8dd595b8` |
+| FA (First Advantage) | per-account | `73252b4d-e918-f111-8341-7ced8dd595b8` |
+| FI (Fisher Investments) | per-account | `01761641-e918-f111-8341-7ced8dd595b8` |
+| FT (Franklin Templeton) | per-account | `36556a71-e918-f111-8341-7ced8dd595b8` |
+| VS (Voya) | per-account | `d4035865-e918-f111-8341-7ced8dd595b8` |
+| **CMK.02 (all)** | Kelly Frank book — all accounts | `790186a1-df18-f111-8341-7ced8dd595b8` |
+| AF (Ameriprise Financial) | per-account | `f54372f8-e718-f111-8341-7ced8dd595b8` |
+| PF (Principal Financial) | per-account | `f711fe2e-e818-f111-8341-7ced8dd595b8` |
+| RB (Robert W. Baird) | per-account | `afe46492-e718-f111-8341-7ced8dd595b8` |
+| WB (William Blair) | per-account | `7eb7d416-e818-f111-8341-7ced8dd595b8` |
+
+**View selection rule:**
+- User names a single account (e.g. "Voya opps") → use that per-account view.
+- User names a group ("CMK.01", "Alexandra's book") → use the corresponding "all" view.
+- User says "my opportunities" / "all opportunities" with no scope → ask whether they mean CMK.01, CMK.02, or both. If both, run each view in turn and merge.
+- For multi-customer asks, prefer the group "all" view + filter by Topic/Owner over running multiple per-account views.
 
 State that this experience supports **interactive opportunity management**.
 
@@ -37,6 +64,81 @@ Legacy host (use only for non-MACC reports below):
 
 ---
 
+## MSX Opportunity playbooks
+
+The opportunity views are Dynamics 365 entity-list grids (not Power BI). Behavior differs from MSXI reports — see "Dynamics opportunity-grid gotchas" below.
+
+### Common Report A — "My / {Owner}'s opportunities + latest comments"
+
+1. Resolve the scope:
+   - If the user says "my", owner = **Bill Andreozzi**.
+   - If the user names someone else, owner = that person.
+   - Pick the right `viewid` from the custom views table (group "all" view if no account specified; per-account view if one is named).
+
+2. Navigate to the view URL with that `viewid`.
+
+3. If the view is not already owner-scoped, filter the **Owner** column to the resolved name. Filter Topic / Opportunity Id similarly if the user added qualifiers.
+
+4. For each row in the filtered grid, capture: **Topic**, **Opportunity Id**, **Account / Customer**, **Owner**.
+
+5. For each opportunity, click the **Topic** link to open the record. On the **Summary** tab, scroll to the **Posts / Notes / Timeline** area and capture the **most recent comment text** and its **timestamp** (and author if visible).
+
+6. Return to the grid (browser back) and repeat for the next row.
+
+7. Deliver as a table:
+   `Topic | Opportunity Id | Account | Owner | Latest comment date | Latest comment (excerpt)`
+
+### Common Report B — "{Owner}'s opportunities + active milestones + latest milestone comment"
+
+1. Resolve owner and view as in Report A. Build the filtered list of opportunities.
+
+2. For each opportunity, click **Topic** to open it.
+
+3. Click the **Milestones** tab (in the tab bar alongside Summary, Timeline, Milestones, …).
+
+4. Identify **active** milestones (status = Active / In Progress / Open — not Completed / Cancelled). For each active milestone, capture:
+   - **Name**
+   - **Workload**
+   - Click into the milestone, then read the **latest comment text + date** (and author if visible).
+   - Back out to the Milestones tab.
+
+5. Back out to the grid. Repeat.
+
+6. Deliver as a nested table grouped by opportunity:
+   `Opportunity (Topic / Id) → [ Milestone Name | Workload | Latest comment date | Latest comment (excerpt) ]`
+
+### Common Task C — "Find opportunity for {customer} / {Opportunity Id} and add a comment"
+
+1. Pick the per-account view for `{customer}` (or the group "all" view if account is unknown / multi-account).
+
+2. Navigate to that view. Filter by **Opportunity Id** (exact match) if provided; otherwise filter by **Topic** and confirm with the user before writing.
+
+3. Click the **Topic** link to open the opportunity.
+
+4. Confirm with the user (preview):
+   - The matched opportunity (Topic, Opportunity Id, Account, Owner)
+   - The exact comment text to be posted
+   - ⚠️ If the comment text is summarized from an email or other private content, surface the source and warn the user before posting.
+   Wait for explicit confirmation.
+
+5. On the **Summary** tab → **Posts / Notes / Timeline** area, click **Add a post** (or the equivalent comment box), paste the text, and submit.
+
+6. Verify the comment now appears at the top of the timeline with today's timestamp. Report the new comment date back to the user.
+
+**Never** post a comment without explicit user confirmation of both the target opportunity and the exact text.
+
+### Dynamics opportunity-grid gotchas
+
+1. The grid is a Dynamics 365 entity-list inside `main.aspx` — it is NOT Power BI. Use normal column-header click → filter UI; do NOT apply MSXI / Power BI slicer patterns here.
+2. Opening an opportunity navigates the same tab. Use **browser back** (or re-navigate to the view URL) to return to the list — the filter state usually persists for the session.
+3. The **Topic** column is the clickable link into the opportunity record. Other columns are not necessarily clickable.
+4. Owner and Topic filters are case-insensitive substring; **Opportunity Id** filter expects an exact id.
+5. After posting a comment, the timeline can take 1–3 seconds to refresh — re-read the latest entry to confirm.
+6. If the page bounces to MSX home on cold-start auth, re-navigate to the view URL after sign-in.
+7. Milestone tab loads asynchronously — wait for the milestone list to render before clicking into individual milestones.
+
+---
+
 ## Self-improvement: propose skill updates for approval
 
 This skill is designed to evolve. **At the end of any session where any of the conditions below are true, prepend a `## Proposed Skill Update (awaiting approval)` section to your response and present a paste-ready diff for the user to approve.** Do NOT silently edit the skill — always ask for approval first.
@@ -57,15 +159,17 @@ Triggers that require a proposed update:
 
 7. **A reference URL changes** — A previously verified URL now redirects, 404s, or routes through a different host. Propose updating the URL.
 
+8. **A new MSX Opportunity custom view is referenced** — User mentions an account / group view-id not in the "Custom views" table. Propose adding it with group, scope, and view-id.
+
 ### Format for the proposed update
 
 ```
 ## Proposed Skill Update (awaiting approval)
 
-**Trigger:** <which of the 7 triggers above>
+**Trigger:** <which of the 8 triggers above>
 **Why it helps:** <one-line benefit — turns saved, ambiguity removed, etc.>
 
-**Section to update:** <e.g., "Verified reports", "MACC question playbook", "Power BI iframe gotchas", "CMK.01">
+**Section to update:** <e.g., "Verified reports", "MACC question playbook", "Power BI iframe gotchas", "CMK.01", "Custom views">
 
 **Suggested replacement / addition (paste-ready):**
 ```text
@@ -188,17 +292,17 @@ Use the customer's **TPID** in the slicer or filter (not the name) — TPID is u
 Default to the relevant account-group TPID collection, or both if "all accounts".
 
 ### CMK.01 (Alexandra Shaw)
-- The Capital Group (TCG, capgroup.com) — **TPID: 644670** — folder: `inbox/Alexandra/CG`
-- Fisher Investments (fi.com) — **TPID: 4591355** — folder: `inbox/Alexandra/FI`
-- First Advantage Corporation (FADV, fadv.com) — **TPID: 16390277** — folder: `inbox/Alexandra/FA`
-- Voya Services Company (voya.com) — **TPID: 21320699** — folder: `inbox/Alexandra/VS`
-- Franklin Administrative Services (Franklin Templeton, franklintempleton.com) — **TPID: 645639** — folder: `inbox/Alexandra/FT`
+- The Capital Group (TCG, capgroup.com) — **TPID: 644670** — folder: `inbox/Alexandra/CG` — MSX view: CG
+- Fisher Investments (fi.com) — **TPID: 4591355** — folder: `inbox/Alexandra/FI` — MSX view: FI
+- First Advantage Corporation (FADV, fadv.com) — **TPID: 16390277** — folder: `inbox/Alexandra/FA` — MSX view: FA
+- Voya Services Company (voya.com) — **TPID: 21320699** — folder: `inbox/Alexandra/VS` — MSX view: VS
+- Franklin Administrative Services (Franklin Templeton, franklintempleton.com) — **TPID: 645639** — folder: `inbox/Alexandra/FT` — MSX view: FT
 
 ### CMK.02 (Kelly Frank)
-- Robert W. Baird & Co Inc (rwbaird.com) — **TPID: 2181032** — folder: `inbox/Kelly/RB`
-- Ameriprise Financial Inc (ampf.com) — **TPID: 6019179** — folder: `inbox/Kelly/AF`
-- William Blair & Company (williamblair.com) — **TPID: 1388856** — folder: `inbox/Kelly/WB`
-- Principal Financial Group (principal.com) — **TPID: 643450** — folder: `inbox/Kelly/PF`
+- Robert W. Baird & Co Inc (rwbaird.com) — **TPID: 2181032** — folder: `inbox/Kelly/RB` — MSX view: RB
+- Ameriprise Financial Inc (ampf.com) — **TPID: 6019179** — folder: `inbox/Kelly/AF` — MSX view: AF
+- William Blair & Company (williamblair.com) — **TPID: 1388856** — folder: `inbox/Kelly/WB` — MSX view: WB
+- Principal Financial Group (principal.com) — **TPID: 643450** — folder: `inbox/Kelly/PF` — MSX view: PF
 
 ### Email searches by customer
 - Search the customer's mail folder.
@@ -228,3 +332,4 @@ When asked to draft an MSX Opportunity, gather:
 - When any self-improvement trigger fires (see "Self-improvement" section), prepend a "Proposed Skill Update (awaiting approval)" section to the response.
 - For unknown customers, follow the "Unknown customer workflow" — no TPID means no report.
 - For "current MACC" questions, **always use the MACC Enrollment Detail grid (FY26 MACC Summary tab) as the source of truth**, then enrich with Account-view fields only after confirming enrollment numbers match.
+- For MSX Opportunity asks, pick the right custom view from the table and use the playbooks (Report A, Report B, Task C). Never post a comment without explicit user confirmation of opportunity + exact text.
