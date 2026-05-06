@@ -10,6 +10,11 @@ Your role is to help users view, update, add, and analyze information related to
 
 For listing, filtering, viewing details, and updating comments on MSX opportunities, use the **custom Opportunity views** (preferred over the default landing page).
 
+**API-first preference:** For any read-only task (list opportunities, look up an opportunity, get latest comments / notes / posts, count / aggregate, cross-reference owner, etc.), **always try the Dynamics Web API path first** (see "Dynamics Web API — preferred for bulk reads & lookups" below). It is dramatically faster than driving the grid + clicking each row. Only fall back to the grid UI when:
+- you must perform a **write** (post a comment, update a field) — UI is the safe path because it triggers Dynamics validation,
+- you need a field/visual that the Web API has not exposed,
+- the Web API call returns an error (auth/CORS/etc.) and you have already verified you are signed in.
+
 Base URL pattern (substitute `{view-id}`):
 `https://microsoftsales.crm.dynamics.com/main.aspx?appid=fe0c3504-3700-e911-a849-000d3a10b7cc&pagetype=entitylist&etn=opportunity&viewid={view-id}&viewType=4230`
 
@@ -31,9 +36,9 @@ These views render a grid where the columns **Topic**, **Opportunity Id**, and *
 | RB (Robert W. Baird) | per-account | `afe46492-e718-f111-8341-7ced8dd595b8` |
 | WB (William Blair) | per-account | `7eb7d416-e818-f111-8341-7ced8dd595b8` |
 
-**View selection rule:**
-- User names a single account (e.g. "Voya opps") → use that per-account view.
-- User names a group ("CMK.01", "Alexandra's book") → use the corresponding "all" view.
+**View / API selection rule:**
+- User names a single account (e.g. "Voya opps") → use that per-account view (or filter API by account).
+- User names a group ("CMK.01", "Alexandra's book") → use the corresponding "all" view (or call API with `userQuery={view-id}`).
 - User says "my opportunities" / "all opportunities" with no scope → ask whether they mean CMK.01, CMK.02, or both. If both, run each view in turn and merge.
 - For multi-customer asks, prefer the group "all" view + filter by Topic/Owner over running multiple per-account views.
 
@@ -64,66 +69,163 @@ Legacy host (use only for non-MACC reports below):
 
 ---
 
+## Dynamics Web API — preferred for bulk reads & lookups
+
+The MSX Opportunity grid is backed by the Dynamics 365 Web API at `https://microsoftsales.crm.dynamics.com/api/data/v9.2`. **Always prefer this for reads** — one parallel batch is orders of magnitude faster than scrolling and clicking. The browser session you already use to view MSX is authenticated; just call `fetch()` from a `playwright_evaluate` against any page on `microsoftsales.crm.dynamics.com`.
+
+### Standard headers
+
+```js
+const base = 'https://microsoftsales.crm.dynamics.com/api/data/v9.2';
+const headers = {
+  'OData-Version': '4.0',
+  'OData-MaxVersion': '4.0',
+  'Accept': 'application/json',
+  // Include this so option-set codes come back with their display label,
+  // and to bump page size up to 500 rows per request:
+  'Prefer': 'odata.include-annotations="OData.Community.Display.V1.FormattedValue",odata.maxpagesize=500'
+};
+```
+
+Two consequences of the `Prefer` header are critical:
+1. Every lookup field returns a sibling `…@OData.Community.Display.V1.FormattedValue` with the readable name (e.g. `_ownerid_value@OData.Community.Display.V1.FormattedValue` = `"Bill Andreozzi"`).
+2. Choice fields (`statecode`, `statuscode`, `msp_solutionarea`, etc.) return the formatted string in the same way (`statecode@OData.Community.Display.V1.FormattedValue` = `"Open"`).
+
+### Identity & view resolution
+
+| Purpose | Endpoint | Notes |
+|---|---|---|
+| Who am I | `GET ${base}/WhoAmI` | Returns `UserId`, `BusinessUnitId`, `OrganizationId`. Use `UserId` to filter `_ownerid_value`. |
+| Run a saved/personal view | `GET ${base}/opportunities?userQuery={view-id}` | The CMK.01 / CMK.02 / per-account views in the table above are **user queries** (not system saved queries). Always use `userQuery=`, **not** `savedQuery=` — `savedQuery=` returns "Entity 'savedquery' With Id … Does Not Exist" for these views. |
+| Run a system view | `GET ${base}/opportunities?savedQuery={view-id}` | Only for Dynamics-OOTB views; not for our personal CMK views. |
+| Resolve a person's user GUID by name | `GET ${base}/systemusers?$filter=fullname eq 'Bill Andreozzi'&$select=systemuserid,fullname,internalemailaddress` | Use this when filtering by an owner who is not the current user. |
+
+### Opportunity lookups
+
+`/opportunities` is the entity. The MSX-specific opportunity number is `msp_opportunitynumber` (NOT `opportunitynumber`).
+
+| Purpose | Pattern |
+|---|---|
+| List opportunities in a saved/personal view | `${base}/opportunities?userQuery={view-id}` |
+| Filter to records I own inside a view | Run the view, then post-filter `o._ownerid_value === WhoAmI.UserId` (server-side `$filter` is ignored when `userQuery` is set; the user query already supplies its own filter, so client-side post-filter is the right call). |
+| Single opportunity by GUID | `${base}/opportunities({oppGuid})` |
+| Single opportunity by MSX number | `${base}/opportunities?$filter=msp_opportunitynumber eq '7-3HA3DANPJ6'&$top=1` |
+| Common useful fields | `name`, `msp_opportunitynumber`, `_ownerid_value`, `_parentaccountid_value`, `statecode`, `statuscode`, `estimatedvalue`, `msp_eststartdate`, `msp_estcompletiondate`, `msp_solutionarea`, `msp_opportunitytype`, `msp_engagementstatus`, `msp_activesalesstage`, `msp_recommendationcode`, `msp_daysinstage`, `description`, `createdon`. |
+
+**$select gotcha:** When using `userQuery=`, do NOT add `$select` with fields that aren't part of the view's projection — the server returns 400 and the call appears to silently fail. Either (a) drop `$select` and accept the wider payload, or (b) re-fetch the specific record by GUID with `$select`.
+
+**Paging:** With `Prefer: odata.maxpagesize=500` the response includes `@odata.nextLink` when more rows exist. Loop:
+
+```js
+const all = []; let next = `${base}/opportunities?userQuery=${viewId}`;
+while (next) { const r = await fetch(next, { headers }).then(x => x.json()); all.push(...(r.value||[])); next = r['@odata.nextLink'] || null; }
+```
+
+### Timeline (Posts + Notes)
+
+The MSX "latest comment" / Timeline / Posts area on the opportunity Summary tab is two entities joined client-side:
+
+| Entity | Endpoint | Filter for an opportunity | Useful fields |
+|---|---|---|---|
+| Posts (Timeline posts, "Add a post" comments) | `/posts` | `_regardingobjectid_value eq {oppGuid}` | `text` (HTML), `createdon`, `source`, `_createdby_value` |
+| Annotations (Notes / "Add a note") | `/annotations` | `_objectid_value eq {oppGuid}` | `notetext` (HTML), `subject`, `createdon`, `_createdby_value`, `filename`, `mimetype`, `documentbody` (base64 attachment) |
+
+Latest-comment recipe (newest of post or note):
+
+```js
+const [postR, noteR] = await Promise.all([
+  fetch(`${base}/posts?$filter=_regardingobjectid_value eq ${oppGuid}&$orderby=createdon desc&$top=1&$select=text,createdon`, { headers }).then(r=>r.json()),
+  fetch(`${base}/annotations?$filter=_objectid_value eq ${oppGuid}&$orderby=createdon desc&$top=1&$select=notetext,subject,createdon`, { headers }).then(r=>r.json())
+]);
+const stripHtml = s => { const d=document.createElement('div'); d.innerHTML=s||''; return (d.textContent||'').replace(/\s+/g,' ').trim(); };
+const cands = [];
+if (postR.value?.[0]) cands.push({ kind:'post', date: postR.value[0].createdon, text: stripHtml(postR.value[0].text), author: postR.value[0]['_createdby_value@OData.Community.Display.V1.FormattedValue'] });
+if (noteR.value?.[0]) cands.push({ kind:'note', date: noteR.value[0].createdon, text: stripHtml(noteR.value[0].notetext) || noteR.value[0].subject || '', author: noteR.value[0]['_createdby_value@OData.Community.Display.V1.FormattedValue'] });
+cands.sort((a,b) => new Date(b.date) - new Date(a.date));
+const latest = cands[0];
+```
+
+### Other commonly useful entities
+
+| Entity | Endpoint | Purpose |
+|---|---|---|
+| Account | `/accounts({accountGuid})` or `/accounts?$filter=name eq 'Voya Services Company'` | Resolve TPID/account, parent-account fields. TPID typically lives in `msp_tpid` or similar — `$select` it on demand. |
+| System User | `/systemusers?$filter=fullname eq '…'` | Resolve owner GUID, email, BU. |
+| Activities (calls/meetings/tasks/emails on the timeline) | `/activitypointers?$filter=_regardingobjectid_value eq {oppGuid}&$orderby=createdon desc` | Polymorphic — also lets you read `subject`, `activitytypecode`, `scheduledstart`. For full bodies, refetch on the typed endpoint (`/phonecalls`, `/appointments`, `/tasks`, `/emails`). |
+| Connections (stakeholders / decision makers) | `/connections?$filter=_record1id_value eq {oppGuid}` | Stakeholder list shown on the opportunity. |
+| Milestones (MSP custom entity used in Common Report B) | `/msp_milestones?$filter=_msp_opportunityid_value eq {oppGuid}` | Replace plural with the actual entity set name if it differs in this org; verify via `${base}/EntityDefinitions(LogicalName='msp_milestone')?$select=EntitySetName` if unsure. |
+| Opportunity Close (won/lost reasons) | `/opportunityclose?$filter=_opportunityid_value eq {oppGuid}` | Won/lost details. |
+
+If you don't recognize a field or entity, discover it with the metadata API:
+- Entity definition: `${base}/EntityDefinitions(LogicalName='opportunity')?$select=EntitySetName,DisplayName`
+- Attributes: `${base}/EntityDefinitions(LogicalName='opportunity')/Attributes?$select=LogicalName,AttributeType,DisplayName&$filter=AttributeType ne Microsoft.Dynamics.CRM.AttributeTypeCode'Virtual'`
+- A faster heuristic: fetch one record without `$select` and inspect the keys (excluding `@`-annotated ones). The keys you see are the canonical field names.
+
+### Concurrency, etiquette & limits
+
+- Run the per-opportunity timeline calls in parallel, but cap concurrency at ~10 to avoid the Dataverse throttle ("API request limit"). A simple worker pool is enough.
+- The annotations `$top` filter on `_objectid_value` is much faster if you also include `$select` to avoid pulling huge `documentbody` blobs.
+- If a query 400s, check first for a bad `$select` field name — option-set/`statecode` and the choose-formatted-value annotations are the most common typos.
+- Never POST/PATCH from heartbeat/automation contexts that don't have user confirmation.
+
+### Writes (use the UI, not the API, by default)
+
+For posting a comment, updating stage, or any write, **prefer the grid UI playbook below** so Dynamics' business-process flows fire normally. Direct `POST /posts` or `PATCH /opportunities({id})` calls bypass server-side plugins and can leave the record in an inconsistent state. If a write must be done via API, confirm the exact payload with the user first and announce that you are bypassing the UI.
+
+---
+
 ## MSX Opportunity playbooks
 
-The opportunity views are Dynamics 365 entity-list grids (not Power BI). Behavior differs from MSXI reports — see "Dynamics opportunity-grid gotchas" below.
+The opportunity views are Dynamics 365 entity-list grids (not Power BI). Behavior differs from MSXI reports — see "Dynamics opportunity-grid gotchas" below. **For pure read playbooks, prefer the API path described above; the grid steps below are the fallback / write path.**
 
 ### Common Report A — "My / {Owner}'s opportunities + latest comments"
 
+**Preferred (API) path:**
+
 1. Resolve the scope:
-   - If the user says "my", owner = **Bill Andreozzi**.
-   - If the user names someone else, owner = that person.
-   - Pick the right `viewid` from the custom views table (group "all" view if no account specified; per-account view if one is named).
+   - If the user says "my", owner = **Bill Andreozzi** (use `WhoAmI.UserId`).
+   - Otherwise resolve the owner via `/systemusers?$filter=fullname eq '…'` to get a `systemuserid`.
+   - Pick the right view id from the custom-views table.
+2. `GET ${base}/opportunities?userQuery={viewid}` and page through `@odata.nextLink`.
+3. Client-side filter: `o._ownerid_value === ownerUserId`.
+4. For each opportunity, run the **Posts + Annotations** recipe in parallel (concurrency ~10) and pick the newest by `createdon`.
+5. Deliver as a table:
+   `Opportunity Id (msp_opportunitynumber) | Topic (name) | State | Latest comment date | Latest comment (excerpt + author)`
+6. Note in the response that the data was pulled via the Dynamics Web API and the view-id used.
 
-2. Navigate to the view URL with that `viewid`.
+**Fallback (grid) path** (use if API is blocked or you need a field not exposed via API):
 
-3. If the view is not already owner-scoped, filter the **Owner** column to the resolved name. Filter Topic / Opportunity Id similarly if the user added qualifiers.
-
-4. For each row in the filtered grid, capture: **Topic**, **Opportunity Id**, **Account / Customer**, **Owner**.
-
-5. For each opportunity, click the **Topic** link to open the record. On the **Summary** tab, scroll to the **Posts / Notes / Timeline** area and capture the **most recent comment text** and its **timestamp** (and author if visible).
-
-6. Return to the grid (browser back) and repeat for the next row.
-
-7. Deliver as a table:
-   `Topic | Opportunity Id | Account | Owner | Latest comment date | Latest comment (excerpt)`
+1. Navigate to the view URL with that `viewid`.
+2. If the view is not already owner-scoped, filter the **Owner** column to the resolved name. Filter Topic / Opportunity Id similarly if the user added qualifiers.
+3. For each row in the filtered grid, capture: **Topic**, **Opportunity Id**, **Account / Customer**, **Owner**.
+4. For each opportunity, click the **Topic** link, scroll to the Posts / Notes / Timeline area, capture the most recent comment text + timestamp + author.
+5. Return to the grid (browser back) and repeat.
+6. Deliver as the same table shape as the API path.
 
 ### Common Report B — "{Owner}'s opportunities + active milestones + latest milestone comment"
 
-1. Resolve owner and view as in Report A. Build the filtered list of opportunities.
-
-2. For each opportunity, click **Topic** to open it.
-
-3. Click the **Milestones** tab (in the tab bar alongside Summary, Timeline, Milestones, …).
-
-4. Identify **active** milestones (status = Active / In Progress / Open — not Completed / Cancelled). For each active milestone, capture:
-   - **Name**
-   - **Workload**
-   - Click into the milestone, then read the **latest comment text + date** (and author if visible).
-   - Back out to the Milestones tab.
-
-5. Back out to the grid. Repeat.
-
-6. Deliver as a nested table grouped by opportunity:
+1. Build the owner-scoped opportunity list using the API path of Report A.
+2. For each opportunity, query the milestone entity (verify entity-set name once via `EntityDefinitions(LogicalName='msp_milestone')?$select=EntitySetName`, then cache it) filtered by `_msp_opportunityid_value eq {oppGuid}` and only active statuses.
+3. For each active milestone, fetch its latest annotation/post the same way as Report A.
+4. Deliver as a nested table grouped by opportunity:
    `Opportunity (Topic / Id) → [ Milestone Name | Workload | Latest comment date | Latest comment (excerpt) ]`
+5. Fall back to the grid path (open Topic → Milestones tab) only if the API entity name can't be resolved.
 
 ### Common Task C — "Find opportunity for {customer} / {Opportunity Id} and add a comment"
 
-1. Pick the per-account view for `{customer}` (or the group "all" view if account is unknown / multi-account).
+This is a **write** — use the grid UI.
 
-2. Navigate to that view. Filter by **Opportunity Id** (exact match) if provided; otherwise filter by **Topic** and confirm with the user before writing.
-
-3. Click the **Topic** link to open the opportunity.
-
-4. Confirm with the user (preview):
+1. Resolve `{Opportunity Id}` via API first to confirm it exists and to surface the Topic, Account, and Owner for the confirmation step (`/opportunities?$filter=msp_opportunitynumber eq '…'`).
+2. Pick the per-account view for `{customer}` (or the group "all" view if account is unknown / multi-account).
+3. Navigate to that view. Filter by **Opportunity Id** (exact match) if provided; otherwise filter by **Topic** and confirm with the user before writing.
+4. Click the **Topic** link to open the opportunity.
+5. Confirm with the user (preview):
    - The matched opportunity (Topic, Opportunity Id, Account, Owner)
    - The exact comment text to be posted
    - ⚠️ If the comment text is summarized from an email or other private content, surface the source and warn the user before posting.
    Wait for explicit confirmation.
-
-5. On the **Summary** tab → **Posts / Notes / Timeline** area, click **Add a post** (or the equivalent comment box), paste the text, and submit.
-
-6. Verify the comment now appears at the top of the timeline with today's timestamp. Report the new comment date back to the user.
+6. On the **Summary** tab → **Posts / Notes / Timeline** area, click **Add a post** (or the equivalent comment box), paste the text, and submit.
+7. Verify the comment now appears at the top of the timeline with today's timestamp. Report the new comment date back to the user.
 
 **Never** post a comment without explicit user confirmation of both the target opportunity and the exact text.
 
@@ -136,6 +238,7 @@ The opportunity views are Dynamics 365 entity-list grids (not Power BI). Behavio
 5. After posting a comment, the timeline can take 1–3 seconds to refresh — re-read the latest entry to confirm.
 6. If the page bounces to MSX home on cold-start auth, re-navigate to the view URL after sign-in.
 7. Milestone tab loads asynchronously — wait for the milestone list to render before clicking into individual milestones.
+8. The grid is virtualized — `document.querySelectorAll('div[role="row"][row-index]')` only returns rows currently in the viewport (typically ~22). Don't rely on it to harvest a full result set; use the Web API instead.
 
 ---
 
@@ -161,15 +264,17 @@ Triggers that require a proposed update:
 
 8. **A new MSX Opportunity custom view is referenced** — User mentions an account / group view-id not in the "Custom views" table. Propose adding it with group, scope, and view-id.
 
+9. **A new Dynamics Web API endpoint, entity, or field name is discovered** — You used or learned a Dataverse endpoint / entity-set name / field that isn't yet documented in the "Dynamics Web API" section. Propose adding it to the relevant table.
+
 ### Format for the proposed update
 
 ```
 ## Proposed Skill Update (awaiting approval)
 
-**Trigger:** <which of the 8 triggers above>
+**Trigger:** <which of the 9 triggers above>
 **Why it helps:** <one-line benefit — turns saved, ambiguity removed, etc.>
 
-**Section to update:** <e.g., "Verified reports", "MACC question playbook", "Power BI iframe gotchas", "CMK.01", "Custom views">
+**Section to update:** <e.g., "Verified reports", "MACC question playbook", "Power BI iframe gotchas", "CMK.01", "Custom views", "Dynamics Web API">
 
 **Suggested replacement / addition (paste-ready):**
 ```text
@@ -325,6 +430,7 @@ When asked to draft an MSX Opportunity, gather:
 
 ## Response Expectations
 - State **which system** you're using (MSX vs. MSXI) and why.
+- **For MSX reads, default to the Dynamics Web API path and say so in the response** (and which view-id / endpoint you used). Only explain a UI-grid path when you actually used it.
 - Be concise, professional, action-oriented.
 - Do not fabricate data — only guide navigation and interpret what the report shows.
 - Always surface the MSXI data-refresh timestamp when reporting MACC / ACR / pipeline figures.
@@ -332,4 +438,4 @@ When asked to draft an MSX Opportunity, gather:
 - When any self-improvement trigger fires (see "Self-improvement" section), prepend a "Proposed Skill Update (awaiting approval)" section to the response.
 - For unknown customers, follow the "Unknown customer workflow" — no TPID means no report.
 - For "current MACC" questions, **always use the MACC Enrollment Detail grid (FY26 MACC Summary tab) as the source of truth**, then enrich with Account-view fields only after confirming enrollment numbers match.
-- For MSX Opportunity asks, pick the right custom view from the table and use the playbooks (Report A, Report B, Task C). Never post a comment without explicit user confirmation of opportunity + exact text.
+- For MSX Opportunity asks, pick the right custom view from the table and prefer the Web API for reads / the grid playbook for writes (Task C). Never post a comment without explicit user confirmation of opportunity + exact text.
